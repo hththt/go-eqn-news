@@ -6,3 +6,4 @@
 2026-11-16 | 用 gorilla/websocket | 成熟 低開銷 對讀寫 deadline 控制直接 | coder/websocket、自寫 RFC6455
 2026-11-16 | handler 在讀取 goroutine 同步呼叫 | 省一次 channel 跳轉 延遲最低 | 回傳 buffered channel（多一次排程 且滿時需丟棄策略）
 2026-11-16 | module 路徑 github.com/hththt/go-eqn-news | 無點路徑被 Go 視為標準庫 外部專案無法引用 | go-eqn-news、虛擬網域
+2026-11-16 | 設定錯誤在 Run 開頭回錯 New 不改簽名 | 不破壞呼叫端且符合「參數異常一律報錯」 | New 回傳 error、負值換預設值
