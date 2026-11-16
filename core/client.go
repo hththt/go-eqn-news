@@ -17,9 +17,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -170,7 +173,47 @@ func nextWait(err error, backoff, maxBackoff time.Duration) time.Duration {
 			wait = max(wait, limitedWait+rand.N(limitedWait/4)) // 下限放在上限之後 不被 MaxBackoff 夾掉
 		}
 	}
+	if he, ok := errors.AsType[*HandshakeError](err); ok && he.RetryAfter > 0 { // 429 照伺服器指示等待
+		wait = max(wait, he.RetryAfter)
+	}
 	return wait
+}
+
+// HandshakeError 是伺服器以 HTTP 狀態拒絕升級時的錯誤（如 429 限流）。
+type HandshakeError struct {
+	StatusCode int
+	RetryAfter time.Duration // 來自 Retry-After 標頭 沒有則為 0
+	Body       string        // 回應內文前段 供診斷
+	Err        error
+}
+
+func (e *HandshakeError) Error() string {
+	s := fmt.Sprintf("eqnnews: 握手失敗 HTTP %d", e.StatusCode)
+	if e.RetryAfter > 0 {
+		s += fmt.Sprintf(" Retry-After=%v", e.RetryAfter)
+	}
+	if e.Body != "" {
+		s += fmt.Sprintf(" body=%q", e.Body)
+	}
+	return s + ": " + e.Err.Error()
+}
+
+func (e *HandshakeError) Unwrap() error { return e.Err }
+
+func newHandshakeError(resp *http.Response, err error) *HandshakeError {
+	he := &HandshakeError{StatusCode: resp.StatusCode, Err: err}
+	if resp.Body != nil { // gorilla 失敗時已把內文前 1KB 讀進記憶體
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		he.Body = strings.TrimSpace(string(b))
+	}
+	if ra := resp.Header.Get("Retry-After"); ra != "" {
+		if sec, perr := strconv.Atoi(ra); perr == nil && sec > 0 {
+			he.RetryAfter = time.Duration(sec) * time.Second
+		} else if t, perr := http.ParseTime(ra); perr == nil {
+			he.RetryAfter = max(time.Until(t), 0)
+		}
+	}
+	return he
 }
 
 var pongMsg = []byte("pong")
@@ -182,7 +225,7 @@ func (c *Client) runOnce(ctx context.Context, h Handler) (gotFrame bool, err err
 	cancel()
 	if err != nil {
 		if resp != nil {
-			return false, fmt.Errorf("eqnnews: 握手失敗 HTTP %d: %w", resp.StatusCode, err)
+			return false, newHandshakeError(resp, err)
 		}
 		return false, fmt.Errorf("eqnnews: 握手失敗: %w", err)
 	}
@@ -201,6 +244,19 @@ func (c *Client) runOnce(ctx context.Context, h Handler) (gotFrame bool, err err
 	}
 
 	wg.Go(func() { // ctx 取消時主動關閉 並負責心跳
+		ping := func() bool {
+			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if werr := conn.WriteMessage(websocket.TextMessage, []byte("ping")); werr != nil {
+				pingErr <- fmt.Errorf("eqnnews: 心跳寫入失敗: %w", werr)
+				_ = conn.Close() // 讓讀端立即返回
+				return false
+			}
+			return true
+		}
+		// 連上立刻送一次 約一個往返即確認線路 安靜時段斷線也不會被當成連線失敗而加倍退避
+		if !ping() {
+			return
+		}
 		t := time.NewTicker(c.cfg.PingInterval)
 		defer t.Stop()
 		for {
@@ -213,10 +269,7 @@ func (c *Client) runOnce(ctx context.Context, h Handler) (gotFrame bool, err err
 				_ = conn.Close()
 				return
 			case <-t.C:
-				_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				if werr := conn.WriteMessage(websocket.TextMessage, []byte("ping")); werr != nil {
-					pingErr <- fmt.Errorf("eqnnews: 心跳寫入失敗: %w", werr)
-					_ = conn.Close() // 讓讀端立即返回
+				if !ping() {
 					return
 				}
 			}

@@ -34,7 +34,13 @@ func fakeServer(t *testing.T, conns, pings *atomic.Int32) *httptest.Server {
 		_ = c.WriteMessage(websocket.TextMessage, []byte(`{}`))
 		if n == 1 {
 			_ = c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseServiceRestart, "restart"))
-			return
+			// 正常關閉握手：讀到客戶端回覆關閉框才斷 TCP 否則客戶端的立即 ping 撞上已關的 socket 會變成 RST 吃掉關閉框
+			_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+			for {
+				if _, _, err := c.ReadMessage(); err != nil {
+					return
+				}
+			}
 		}
 		for {
 			_, msg, err := c.ReadMessage()
@@ -192,5 +198,78 @@ func TestValidate(t *testing.T) {
 	}
 	if err := New(Config{}).Run(context.Background(), nil); err == nil {
 		t.Fatal("nil handler 應報錯")
+	}
+}
+
+// 連上後不等 PingInterval 立即送第一個 ping。
+func TestImmediatePing(t *testing.T) {
+	got := make(chan time.Time, 1)
+	up := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		for {
+			_, msg, err := c.ReadMessage()
+			if err != nil {
+				return
+			}
+			if string(msg) == "ping" {
+				select {
+				case got <- time.Now():
+				default:
+				}
+				_ = c.WriteMessage(websocket.TextMessage, []byte("pong"))
+			}
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	go func() {
+		_ = New(Config{URL: wsURL(srv), PingInterval: 10 * time.Second, ReadTimeout: 20 * time.Second}).Run(ctx, func(News) {})
+	}()
+	select {
+	case at := <-got:
+		if d := at.Sub(start); d > time.Second {
+			t.Fatalf("第一個 ping 太晚 %v", d)
+		}
+	case <-ctx.Done():
+		t.Fatal("沒收到立即 ping")
+	}
+}
+
+// 429 時錯誤帶出狀態碼 內文與 Retry-After 且重連等待不少於 Retry-After。
+func TestHandshake429(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "7")
+		http.Error(w, "rate limited: slow down", http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var discErr error
+	c := New(Config{URL: wsURL(srv), OnDisconnect: func(err error) { discErr = err; cancel() }})
+	_ = c.Run(ctx, func(News) {})
+
+	he, ok := errors.AsType[*HandshakeError](discErr)
+	if !ok {
+		t.Fatalf("應為 *HandshakeError 得到 %v", discErr)
+	}
+	if he.StatusCode != 429 || he.RetryAfter != 7*time.Second || !strings.Contains(he.Body, "slow down") {
+		t.Fatalf("欄位錯誤 %+v", he)
+	}
+	if !errors.Is(discErr, websocket.ErrBadHandshake) {
+		t.Fatalf("應可 Unwrap 成 ErrBadHandshake")
+	}
+	for range 100 {
+		if w := nextWait(discErr, time.Second, 30*time.Second); w < 7*time.Second {
+			t.Fatalf("等待 %v 少於 Retry-After", w)
+		}
 	}
 }
